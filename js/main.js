@@ -1,122 +1,241 @@
-import snake from './games/snake.js';
-import breakout from './games/breakout.js';
-import game2048 from './games/2048.js';
-import memory from './games/memory.js';
-import minesweeper from './games/minesweeper.js';
+import { CAMPAIGN, CHAPTERS } from './story.js';
+import { portraitMarkup } from './art/portraits.js';
+import { createHost, loadSave, writeSave, sound } from './engine.js';
+import shadowLedger from './games/shadow-ledger.js';
+import ricochet from './games/ricochet.js';
+import alloy from './games/alloy.js';
+import lineup from './games/lineup.js';
+import deepField from './games/deep-field.js';
 
-const GAMES = [snake, breakout, game2048, memory, minesweeper];
+const GAMES = {
+  'shadow-ledger': shadowLedger,
+  ricochet,
+  alloy,
+  lineup,
+  'deep-field': deepField,
+};
 
 const app = document.getElementById('app');
-let cleanup = null;
+const save = loadSave();
 
-function teardown() {
-  if (typeof cleanup === 'function') cleanup();
-  cleanup = null;
+let roundCleanup = null;
+let roundHost = null;
+let current = null;
+
+function chapterById(id) {
+  return CHAPTERS.find((chapter) => chapter.id === id) || null;
 }
 
-function currentGameId() {
-  const match = location.hash.match(/^#\/play\/([a-z0-9-]+)/i);
-  return match ? match[1] : null;
+function stopRound() {
+  if (typeof roundCleanup === 'function') {
+    try {
+      roundCleanup();
+    } catch {
+      /* a game's cleanup must never break navigation */
+    }
+  }
+  roundCleanup = null;
+  if (roundHost) {
+    roundHost.destroy();
+    roundHost = null;
+  }
 }
 
-function renderLauncher() {
-  teardown();
-  document.title = "Tony's Arcade — five games";
-  app.innerHTML = `
-    <section class="launcher">
-      <p class="eyebrow">Com.Tonys.darkheist · arcade</p>
-      <h1>Five games, ready to play</h1>
-      <p class="lede">Every game runs right here in the browser. Pick one and it launches instantly.</p>
-      <ul class="cards">
-        ${GAMES.map(
-          (g) => `
-          <li>
-            <a class="card" href="#/play/${g.id}" data-game="${g.id}" style="--accent:${g.tone}">
-              <span class="card-icon" aria-hidden="true">${g.icon}</span>
-              <span class="card-body">
-                <span class="card-title">${g.title}</span>
-                <span class="card-blurb">${g.blurb}</span>
-              </span>
-              <span class="card-cta">Play</span>
-            </a>
-          </li>`
-        ).join('')}
-      </ul>
-      <p class="foot">${GAMES.length} games · keyboard, mouse and touch supported</p>
-    </section>`;
+/* ---------------------------------------------------------------- launcher */
 
-  app.querySelectorAll('.card').forEach((card) => {
-    card.addEventListener('click', (event) => {
-      event.preventDefault();
-      location.hash = `#/play/${card.dataset.game}`;
+function cardMarkup(chapter) {
+  const won = Boolean(save.wins?.[chapter.id]);
+  const best = save.best?.[chapter.id];
+  return `<li class="chapter-card" style="--tone:${chapter.tone}" data-card="${chapter.id}">
+    <div class="card-top">
+      <span class="night">Night ${chapter.night}</span>
+      <span class="genre">${chapter.genre}</span>
+      <span class="difficulty">${chapter.difficulty}</span>
+    </div>
+    <div class="card-cast">
+      ${chapter.cast.map((character) => portraitMarkup(character, 'sm')).join('')}
+    </div>
+    <h2>${chapter.title}</h2>
+    <p class="logline">${chapter.logline}</p>
+    <p class="location">${chapter.location}</p>
+    <div class="card-foot">
+      <span class="badge${won ? ' is-won' : ''}">${won ? 'Cleared' : best ? `Best ${best}` : 'Not cleared'}</span>
+      <button class="launch" type="button" data-open="${chapter.id}">Launch</button>
+    </div>
+  </li>`;
+}
+
+function launcher() {
+  stopRound();
+  current = null;
+  document.title = `${CAMPAIGN.title} — five nights`;
+  const won = CHAPTERS.filter((chapter) => save.wins?.[chapter.id]).length;
+
+  app.innerHTML = `<section class="launcher">
+    <header class="campaign-head">
+      <p class="eyebrow">Carver City · ${CAMPAIGN.season}</p>
+      <h1>${CAMPAIGN.title}</h1>
+      <p class="tagline">${CAMPAIGN.tagline}</p>
+      <p class="lede">${CAMPAIGN.intro}</p>
+      <div class="campaign-meter">
+        <span>Campaign</span>
+        <div class="meter"><i style="width:${(won / CHAPTERS.length) * 100}%"></i></div>
+        <b>${won}/${CHAPTERS.length}</b>
+      </div>
+      ${won === CHAPTERS.length ? `<p class="finale">${CAMPAIGN.finale}</p>` : ''}
+    </header>
+    <ul class="chapters">${CHAPTERS.map(cardMarkup).join('')}</ul>
+    <p class="foot">Five genres · five specialists · five animals · no safe night</p>
+  </section>`;
+
+  app.querySelectorAll('[data-open]').forEach((button) => {
+    button.addEventListener('click', () => {
+      location.hash = `#/night/${button.dataset.open}`;
     });
   });
 }
 
-function renderGame(game) {
-  teardown();
-  document.title = `${game.title} — Tony's Arcade`;
-  app.innerHTML = `
-    <section class="game-view">
-      <header class="game-head">
-        <a class="back" href="#/" data-back>All games</a>
-        <h2><span aria-hidden="true">${game.icon}</span> ${game.title}</h2>
-        <div class="hud">
-          <span data-label>Score</span>
-          <b data-score>0</b>
-          <span data-status></span>
-        </div>
-      </header>
-      <div class="stage" data-stage></div>
-    </section>`;
+/* ----------------------------------------------------------- chapter shell */
 
-  const stage = app.querySelector('[data-stage]');
-  const labelEl = app.querySelector('[data-label]');
-  const scoreEl = app.querySelector('[data-score]');
-  const statusEl = app.querySelector('[data-status]');
+function openChapter(id) {
+  const chapter = chapterById(id);
+  if (!chapter) {
+    location.hash = '#/';
+    return;
+  }
+  stopRound();
+  current = chapter;
+  document.title = `${chapter.title} — ${CAMPAIGN.title}`;
 
-  const ui = {
-    score(value, label = 'Score') {
-      labelEl.textContent = label;
-      scoreEl.textContent = String(value);
-    },
-    status(text) {
-      statusEl.textContent = text ? `· ${text}` : '';
-    },
-    overlay({ title, message, action = 'Play again', onAction }) {
-      ui.closeOverlay();
-      const el = document.createElement('div');
-      el.className = 'overlay';
-      el.dataset.overlay = '';
-      el.innerHTML = '<div class="overlay-card"><h3></h3><p></p><button class="btn" type="button"></button></div>';
-      el.querySelector('h3').textContent = title;
-      el.querySelector('p').textContent = message;
-      const button = el.querySelector('button');
-      button.textContent = action;
-      button.addEventListener('click', () => {
-        ui.closeOverlay();
-        if (typeof onAction === 'function') onAction();
-      });
-      stage.appendChild(el);
-    },
-    closeOverlay() {
-      stage.querySelectorAll('[data-overlay]').forEach((el) => el.remove());
-    },
-  };
+  app.innerHTML = `<section class="chapter-view" style="--tone:${chapter.tone}">
+    <header class="chapter-head">
+      <a class="back" href="#/" data-home>Campaign</a>
+      <div class="chapter-id">
+        <span>Night ${chapter.night} · ${chapter.genre}</span>
+        <h2><i aria-hidden="true">${chapter.icon}</i> ${chapter.title}</h2>
+      </div>
+      <div class="hud" data-hud></div>
+    </header>
+    <div class="stage" data-stage></div>
+  </section>`;
 
-  app.querySelector('[data-back]').addEventListener('click', (event) => {
+  app.querySelector('[data-home]').addEventListener('click', (event) => {
     event.preventDefault();
     location.hash = '#/';
   });
 
-  cleanup = game.mount(stage, ui);
+  renderBrief(chapter);
 }
 
+function renderBrief(chapter) {
+  const stage = app.querySelector('[data-stage]');
+  if (!stage) return;
+  const best = save.best?.[chapter.id];
+  const won = Boolean(save.wins?.[chapter.id]);
+
+  stage.innerHTML = `<article class="brief">
+    <div class="brief-head">
+      <p class="brief-loc">${chapter.location}</p>
+      <p class="brief-logline">${chapter.logline}</p>
+    </div>
+    <div class="cast-row">${chapter.cast.map((character) => portraitMarkup(character, 'md')).join('')}</div>
+    <div class="dialogue">
+      ${chapter.lines
+        .map(
+          ([speaker, text]) =>
+            `<p class="line"><b>${speaker}</b><span>${text}</span></p>`
+        )
+        .join('')}
+    </div>
+    <div class="brief-grid">
+      <div>
+        <h3>Job objectives</h3>
+        <ul class="objectives">${chapter.objectives.map((item) => `<li>${item}</li>`).join('')}</ul>
+      </div>
+      <div>
+        <h3>Field notes</h3>
+        <p class="tips">${chapter.tips}</p>
+        <p class="brief-meta">Difficulty <b>${chapter.difficulty}</b>${won ? ' · cleared' : best ? ` · best ${best}` : ''}</p>
+      </div>
+    </div>
+    <div class="brief-foot">
+      <button class="btn primary" type="button" data-start>Begin night ${chapter.night}</button>
+    </div>
+  </article>`;
+
+  stage.querySelector('[data-start]').addEventListener('click', () => startRound(chapter));
+}
+
+/* ------------------------------------------------------------------- round */
+
+function startRound(chapter) {
+  const stage = app.querySelector('[data-stage]');
+  stopRound();
+  stage.innerHTML = '';
+
+  const hudEl = app.querySelector('[data-hud]');
+  const host = createHost();
+  roundHost = host;
+  let finished = false;
+
+  const api = {
+    host,
+    stage,
+    sound,
+    hud(fields = {}) {
+      hudEl.innerHTML = Object.entries(fields)
+        .map(([label, value]) => `<span class="chip"><i>${label}</i><b>${value}</b></span>`)
+        .join('');
+    },
+    finish(result = {}) {
+      if (finished) return;
+      finished = true;
+      const win = Boolean(result.win);
+      const score = Math.max(0, Math.round(Number(result.score) || 0));
+      save.wins = save.wins || {};
+      save.best = save.best || {};
+      if (win) save.wins[chapter.id] = true;
+      if (score > (save.best[chapter.id] || 0)) save.best[chapter.id] = score;
+      writeSave(save);
+      sound(win ? 'win' : 'lose');
+
+      const line = win ? chapter.win : chapter.lose;
+      const overlay = document.createElement('div');
+      overlay.className = 'overlay';
+      overlay.dataset.overlay = '';
+      overlay.innerHTML = `<div class="result-card">
+        <p class="result-tag">${win ? `Night ${chapter.night} cleared` : `Night ${chapter.night} failed`}</p>
+        <h3>${win ? 'Job done' : 'Job blown'}</h3>
+        <p class="result-line"><b>${line[0]}</b> ${line[1]}</p>
+        <p class="result-score">Score <b>${score}</b>${win ? '' : ' · no record'}</p>
+        <p class="result-note">${win ? 'Recorded to the campaign.' : 'The night can be run again.'}</p>
+        <div class="result-actions">
+          <button class="btn ghost" type="button" data-retry>Run it again</button>
+          <button class="btn primary" type="button" data-hub>Back to campaign</button>
+        </div>
+      </div>`;
+      stage.appendChild(overlay);
+      overlay.querySelector('[data-retry]').addEventListener('click', () => {
+        overlay.remove();
+        startRound(chapter);
+      });
+      overlay.querySelector('[data-hub]').addEventListener('click', () => {
+        location.hash = '#/';
+      });
+    },
+  };
+
+  api.hud({ Ready: '—' });
+  const game = GAMES[chapter.id];
+  roundCleanup = game ? game.mount(stage, api) || null : null;
+}
+
+/* ------------------------------------------------------------------- route */
+
 function route() {
-  const id = currentGameId();
-  const game = id ? GAMES.find((g) => g.id === id) : null;
-  if (game) renderGame(game);
-  else renderLauncher();
+  const match = location.hash.match(/^#\/night\/([a-z0-9-]+)/i);
+  if (match) openChapter(match[1]);
+  else launcher();
 }
 
 window.addEventListener('hashchange', route);
